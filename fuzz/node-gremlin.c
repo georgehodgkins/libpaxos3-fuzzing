@@ -15,6 +15,7 @@
 #define ACCEPTOR_PATH "../sample/acceptor"
 #define CLIENT_PATH "../sample/client"
 
+/*------Node invocation wrappers-----*/
 typedef void (*invoke_node_t) (const char*, const char*);
 
 __attribute__((noreturn))
@@ -45,6 +46,7 @@ invoke_node_t invoke_node[] = {
 	&invoke_client
 };
 
+/*-------Node gremlin struct----*/
 struct node_gremlin {
 	pid_t* children;
 	node_type_t* child_type;
@@ -56,6 +58,7 @@ struct node_gremlin {
 	atomic_bool nohup;
 } nodectl;
 
+/*-----Termination setup-----*/
 void gremlin_normal_exit () {
 	atomic_store(&nodectl.nohup, false);
 	kill(0, SIGINT); // send to whole process group
@@ -86,7 +89,7 @@ void handle_sigchld (int signum, siginfo_t* info, void* ctx) {
 	}
 	
 	if (!ownkill) {
-		atomic_store(&nodectl.nohup, false);
+		atomic_store(&nodectl.nohup, false); // tell other fuzzing components to return
 		if (info->si_code == SI_QUEUE) {
 			gremlin_normal_exit(); 
 		} else {
@@ -96,6 +99,7 @@ void handle_sigchld (int signum, siginfo_t* info, void* ctx) {
 	}
 }
 
+/*-----Node gremlin initializer-----*/
 static char mtmpnam[32];
 
 const char* start_node_gremlin (unsigned maxnode) {
@@ -108,12 +112,18 @@ const char* start_node_gremlin (unsigned maxnode) {
 	nodectl.loid = 0;
 	nodectl.hiid = 0;
 
+	// install signal handler
 	struct sigaction sa = {
 		.sa_sigaction = handle_sigchld,
 		.sa_flags = SA_NOCLDSTOP | SA_SIGINFO
 	};
 	int s = sigaction(SIGCHLD, &sa, NULL);
+	if (s == -1) {
+		perror("node gremlin sigchld install");
+		abort();
+	}
 
+	// generate temporary config file for libpaxos
 	strcpy(mtmpnam, "/tmp/paxfuzzconfXXXXXX");
 	int fd = mkstemp(mtmpnam);
 	if (fd == -1) {
@@ -138,6 +148,7 @@ void free_node_gremlin () {
 	unlink(nodectl.conf);
 }
 
+/*-----Node control APIs-----*/
 void gremlin_add_node(node_type_t type) {
 	assert(type != NODE_NONE);
 

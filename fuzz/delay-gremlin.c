@@ -31,9 +31,10 @@ static struct gremlin_ctl* gremlin; // parsed gremlin control struct in shm
 static pthread_attr_t async_attr; // attributes for async threads
 
 
-/*-----Delay policies-----*/
-// Various ways to specify message delays deterministically
-// from a stream of arbitrary bytes
+/*-----Delay policy parameters-----*/
+// various combinations of parameters for different delay policies
+// held in union in the control struct
+// one param type can be used by multiple policies
 typedef struct {
 	uint16_t factor;
 } bsaf_single_param;
@@ -66,14 +67,14 @@ typedef struct {
 
 /*-----Gremlin struct def-----*/
 typedef struct gremlin_ctl {
-	atomic_bool* nohup;
-	delay_policy_t dpol;
-	inject_delay_t inject_delay;
+	atomic_bool* nohup; // termination indicator for fuzz components
+	delay_policy_t dpol; // delay policy for this run
+	inject_delay_t inject_delay; // delay injector for this run
 	int wsock_fd; // socket to send messages to oracle
 	int rfifo_fd; // fifo to get delay bytes
-	unsigned int RS;
-	struct random_data* RF;
-	union {
+	unsigned int RS; // random seed (zero if no RF)
+	struct random_data* RF; // PRNG state array (null if no RF)
+	union { // parameters for delay policy, see above
 		bsaf_single_param single;
 		bsaf_permsg_param permsg;
 		bsaf_pernode_param pernode;
@@ -81,23 +82,21 @@ typedef struct gremlin_ctl {
 	} param;
 } gremlin_ctl;
 
-// get a byte off the FIFO
-static uint8_t inj_getb(int fifo_fd) {
-	uint8_t nxt;
-	int s = read(fifo_fd, &nxt, 1);
-	if (s == -1) {
-		if (errno == EAGAIN) { // no more bytes to read, normal termination condition
-			sigqueue(getppid(), SIGCHLD, (union sigval) 0);
-			exit(0);
-		} else {
-			perror("delay fifo read");
-			abort();
-		}
-	}
-	return nxt;
-}
+const size_t policy_reqd_size[] = {
+	0,
+	sizeof(bsaf_single_param),
+	sizeof(bsaf_single_param),
+	sizeof(bsaf_pernet_param),
+	sizeof(bsaf_pernode_param),
+	sizeof(bsaf_pernode_param),
+	sizeof(bsaf_permsg_param),
+	sizeof(bsaf_single_param)
+};
 
-// constructors for policy objects held in union
+/*-----Policy param parsers-----*/
+// these initialize the policy params from the beginning of the fuzz vector
+typedef void (*policy_parse_t)(int, gremlin_ctl*);
+
 void parse_single_param(int fd, gremlin_ctl* ctl) {
 	int s = read(fd, &ctl->param.single.factor, 2);
 	assert(s == 2);
@@ -142,7 +141,90 @@ void parse_pernet_param(int fd, gremlin_ctl *ctl) {
 	assert(s == 2);
 }
 
-typedef void (*policy_parse_t)(int, gremlin_ctl*);
+static const policy_parse_t policy_parser[] = {
+	NULL,
+	&parse_single_param,
+	&parse_single_param,
+	&parse_pernet_param,
+	&parse_pernode_param,
+	&parse_pernode_param,
+	&parse_permsg_param,
+	&parse_single_param
+};
+
+static const size_t rf_reqd_size = sizeof(unsigned int);
+
+/*----Delay policy common code-----*/
+
+// get a byte off the FIFO, terminating and propagating that termination
+// if all bytes have been consumed. All delay policies should call this function
+static uint8_t inj_getb(int fifo_fd) {
+	uint8_t nxt;
+	int s = read(fifo_fd, &nxt, 1);
+	if (s == -1) {
+		if (errno == EAGAIN) { // no more bytes to read, normal termination condition
+			sigqueue(getppid(), SIGCHLD, (union sigval) 0);
+			exit(0);
+		} else {
+			perror("delay fifo read");
+			abort();
+		}
+	}
+	return nxt;
+}
+
+// sets the timestamp on a wrapped message to the oracle
+// TODO: probably unnecessary. written assuming we have to order packets off multiple sockets
+// but we do not
+void gremlin_set_ts (oracle_message* m) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	// in nanoseconds
+	m->ts = (uint64_t) ts.tv_sec*1000000000 + ts.tv_nsec;
+}
+
+// the async sender thread is what actually injects the delay
+typedef struct async_sender_args {
+	struct bufferevent* bev;
+	oracle_message msg;
+} async_sender_args;
+
+void* async_sender_thread(void* arg_v) {
+	async_sender_args* arg = arg_v;
+	// get randomness
+	int rd = 0;
+	if (gremlin->RF) {
+		random_r(gremlin->RF, &rd);
+	}
+	// inject delay according to delay policy
+	gremlin->inject_delay(gremlin->rfifo_fd, rd, &arg->msg);
+	// send message to oracle
+	gremlin_set_ts(&arg->msg);
+	write(gremlin->wsock_fd, &arg->msg, sizeof(oracle_message));
+	// send message to its intended recipients
+	real_send_paxos_message(arg->bev, &arg->msg.paxmsg);
+
+	free(arg);
+	return NULL; 
+}
+
+// this function interposes on the libpaxos function of the same name via LD_PRELOAD
+// it is the single point of attachment for both the oracle and delay gremlin components
+void send_paxos_message(struct bufferevent* bev, paxos_message* msg) {
+	async_sender_args* arg = malloc(sizeof(async_sender_args));
+	arg->bev = bev;
+	memcpy(&arg->msg.paxmsg, msg, sizeof(paxos_message)); 
+	pthread_t thr;
+	int s = pthread_create(&thr, &async_attr, async_sender_thread, arg);
+	assert(s == 0);
+}
+
+/*-----Delay policy implementations----*/
+// All of these take the following args:
+// fifo_fd - byte fifo to get delay from
+// rd - random delay factor (zero if no random delay)
+// msg - message to delay
+
 
 // single factor for all messages
 static void inject_bsaf_unified(int fifo_fd, int rd, oracle_message* msg) {
@@ -269,8 +351,8 @@ static void inject_bsaf_pernet(int fifo_fd, int rd, oracle_message* msg) {
 	nanosleep(&ts, NULL);
 }
 
+// get a factor the first time a node sends a message and use it for the whole lifetime
 static void inject_fixed_pernode(int fifo_fd, int rd, oracle_message* msg) {
-	// get a factor once per node instance
 	static uint8_t instat = 0;
 	if (instat == 0) instat = inj_getb(fifo_fd);
 	struct timespec ts = {0, rd + instat*gremlin->param.single.factor};
@@ -289,12 +371,14 @@ static const unsigned msg_size_tab[] = {
 	[PAXOS_CLIENT_VALUE] = sizeof(paxos_client_value)
 };
 
+// single factor, multiplied by size of the underlying message
 static void inject_bsaf_persize(int fifo_fd, int rd, oracle_message* msg) {
 	struct timespec ts = {0, rd};
 	ts.tv_nsec += gremlin->param.single.factor*msg_size_tab[msg->paxmsg.type];
 	nanosleep(&ts, NULL);
 }
 
+// no delay, other than possibly random
 static void inject_none (int fifo_fd, int rd, oracle_message* msg) {
 	struct timespec ts = {0, rd};
 	if (ts.tv_nsec) nanosleep(&ts, NULL);
@@ -311,32 +395,11 @@ static const inject_delay_t delay_injector[] = {
 	&inject_bsaf_unified
 };
 
-const size_t policy_reqd_size[] = {
-	0,
-	sizeof(bsaf_single_param),
-	sizeof(bsaf_single_param),
-	sizeof(bsaf_pernet_param),
-	sizeof(bsaf_pernode_param),
-	sizeof(bsaf_pernode_param),
-	sizeof(bsaf_permsg_param),
-	sizeof(bsaf_single_param)
-};
-
-static const policy_parse_t policy_parser[] = {
-	NULL,
-	&parse_single_param,
-	&parse_single_param,
-	&parse_pernet_param,
-	&parse_pernode_param,
-	&parse_pernode_param,
-	&parse_permsg_param,
-	&parse_single_param
-};
-
-static const size_t rf_reqd_size = sizeof(unsigned int);
 
 
 /*-----Delay pusher thread-----*/
+// shoves bytes from the fuzz vector down the fifo for policy handlers to consume
+// for short vectors, probably done before the nodes even launch
 typedef struct delay_pusher_args {
 	uint8_t* loop;
 	size_t loop_len;
@@ -360,6 +423,9 @@ void* delay_pusher_thread (void* arg_v) {
 }
 
 /*-----Setup functions-----*/
+// The first two are called by the testbed, once
+// the ones marked ctor and dtor are run before main() on nodes with this library attached
+// (via LD_PRELOAD)
 static void gremlin_dispatch (const char* config, gremlin_ctl* ctl) {
 	int fd = open(config, O_CLOEXEC | O_RDONLY);
 	if (fd == -1) {
@@ -421,7 +487,7 @@ static void gremlin_dispatch (const char* config, gremlin_ctl* ctl) {
 	assert(s == 0);
 }
 
-
+// this is the one called from external code
 void start_delay_gremlin (const char* config, int osock, atomic_bool* nohup) {
 	// set up shm region for inter-process control info
 	ctl_fd = shm_open(GREMLIN_CTL_PATH, O_RDWR | O_CREAT | O_EXCL, 0);
@@ -486,47 +552,5 @@ __attribute__((destructor))
 void close_gremlin_process_instance (void) {
 	munmap(gremlin, sizeof(struct gremlin_ctl));
 	close(ctl_fd);
-}
-
-
-typedef struct async_sender_args {
-	struct bufferevent* bev;
-	oracle_message msg;
-} async_sender_args;
-
-void gremlin_set_ts (oracle_message* m) {
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	// in nanoseconds
-	m->ts = (uint64_t) ts.tv_sec*1000000000 + ts.tv_nsec;
-}
-
-void* async_sender_thread(void* arg_v) {
-	async_sender_args* arg = arg_v;
-	// get randomness
-	int rd = 0;
-	if (gremlin->RF) {
-		random_r(gremlin->RF, &rd);
-	}
-	// inject delay according to control params
-	gremlin->inject_delay(gremlin->rfifo_fd, rd, &arg->msg);
-	// send message to oracle
-	gremlin_set_ts(&arg->msg);
-	write(gremlin->wsock_fd, &arg->msg, sizeof(oracle_message));
-	// send message to its intended recipients
-	real_send_paxos_message(arg->bev, &arg->msg.paxmsg);
-
-	free(arg);
-	return NULL; 
-}
-
-// intercepts calls to libpaxos function of the same name
-void send_paxos_message(struct bufferevent* bev, paxos_message* msg) {
-	async_sender_args* arg = malloc(sizeof(async_sender_args));
-	arg->bev = bev;
-	memcpy(&arg->msg.paxmsg, msg, sizeof(paxos_message)); 
-	pthread_t thr;
-	int s = pthread_create(&thr, &async_attr, async_sender_thread, arg);
-	assert(s == 0);
 }
 	
