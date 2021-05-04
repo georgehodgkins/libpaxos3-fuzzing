@@ -11,7 +11,7 @@
  * - Client messages: Also using process control mechanisms
  * See below for a detailed description of input format.
  *
- * The following invariants are checked by snooping on messages via libevent:
+ * The following invariants are checked by snooping on messages:
  * - Validity: No value is chosen unless it is first proposed.
  * - Agreement1: An acceptor accepts proposal n iff it has not promised to 
  *   	only consider proposals numbered m > n
@@ -19,14 +19,12 @@
  *   	either v belongs to the highest-numbered accepted proposal among its members, 
  *   	or no member has accepted any proposal.
  *
- *  Agreement1 and Agreement2 imply Agreement: Only one value can be accepted by a quorum.
+ *  Agreement1 AND Agreement2 = Agreement: Only one value can be accepted by a quorum.
  *    
  */
 
 #include "paxos.h"
 #include "evpaxos.h"
-#include "peers.h"
-#include <event2/event.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
@@ -34,14 +32,23 @@
 #include <assert.h>
 #include <limits.h>
 #include <signal.h>
+#include <poll.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <time.h>
 
 #include "oracle.h"
 
 /*----------Invariant-checking oracle-----------*/
 
 struct oracle_s {
-	struct event_base* base;
-	struct peers* peers;
+	int isock; // input side of socket pair (given to gremlin)
+	int osock; // output side of socket pair (monitored by oracle)
+	atomic_bool* nohup; 
+	/*struct pollfd* poll_set;
+	unsigned poll_count;
+	oracle_message* msg_queue;*/
+
 	unsigned acc_count;
 	unsigned pro_count;
 	// acceptor state
@@ -166,9 +173,7 @@ static void oracle_assert_invariants (oracle* O) {
 	}
 }
 
-// libevent callbacks
-static void oracle_handle_prepare(struct peer* p, paxos_message* msg, void* arg) {
-	oracle* O = (oracle*) arg;
+static void oracle_handle_prepare(paxos_message* msg, oracle* O) {
 	paxos_prepare* prep = &msg->u.prepare; 
 	O->pro_prepbal[prep->iid] = prep->ballot;
 	paxos_log_info("ORACLE: saw PREPARE from prop %u with ballot %u\n", 
@@ -176,8 +181,7 @@ static void oracle_handle_prepare(struct peer* p, paxos_message* msg, void* arg)
 	oracle_assert_invariants(O);
 }
 
-static void oracle_handle_promise(struct peer* p, paxos_message* msg, void* arg) {
-	oracle* O = (oracle*) arg;
+static void oracle_handle_promise(paxos_message* msg, oracle* O) {
 	paxos_promise* prom = &msg->u.promise;
 	O->acc_prombal[prom->aid] = prom->ballot;
 	O->acc_lastbal[prom->aid] = prom->value_ballot;
@@ -187,8 +191,7 @@ static void oracle_handle_promise(struct peer* p, paxos_message* msg, void* arg)
 	oracle_assert_invariants(O);
 }
 
-static void oracle_handle_accept(struct peer* p, paxos_message* msg, void* arg) {
-	oracle* O = (oracle*) arg;
+static void oracle_handle_accept(paxos_message* msg, oracle* O) {
 	paxos_accept* acc = &msg->u.accept;
 	O->pro_propbal[acc->iid] = acc->ballot;
 	O->pro_propval[acc->iid] = acc->value;
@@ -199,8 +202,7 @@ static void oracle_handle_accept(struct peer* p, paxos_message* msg, void* arg) 
 	oracle_assert_invariants(O);
 }
 
-static void oracle_handle_accepted(struct peer* p, paxos_message* msg, void* arg) {
-	oracle* O = (oracle*) arg;
+static void oracle_handle_accepted(paxos_message* msg, oracle* O) {
 	paxos_accepted* accd = &msg->u.accepted;
 	O->acc_accbal[accd->aid] = accd->ballot;
 	O->acc_accval[accd->aid] = accd->value;
@@ -210,8 +212,7 @@ static void oracle_handle_accepted(struct peer* p, paxos_message* msg, void* arg
 	oracle_assert_invariants(O);
 }
 
-static void oracle_handle_client_value (struct peer* p, paxos_message* msg, void* arg) {
-	oracle* O = (oracle*) arg;
+static void oracle_handle_client_value (paxos_message* msg, oracle* O) {
 	paxos_client_value* cv = &msg->u.client_value;
 	O->cli_vhist[O->cli_vhist_len++] = cv->value;
 	O->cli_vhist_len %= O->vhist_cap;
@@ -219,25 +220,39 @@ static void oracle_handle_client_value (struct peer* p, paxos_message* msg, void
 	oracle_assert_invariants(O);
 }
 
-static void oracle_handle_sigint (int sig, short ev, void* arg) {
-	struct event_base* base = arg;
-	event_base_loopexit(base, NULL);
-}
-
-// TODO: handle repeat, trim, preempted, acceptor_state
-
-static void oracle_connect_to_proposers(oracle* O, struct evpaxos_config* tconf) {
-	for (int i = 0; i < O->pro_count; ++i) {
-		struct sockaddr_in addr = evpaxos_proposer_address(tconf, i);
-		peers_connect(O->peers, i, &addr);
+static void oracle_handle_message (oracle* O, oracle_message* M) {
+	switch (M->paxmsg.type) {
+	case (PAXOS_PREPARE):
+		oracle_handle_prepare(&M->paxmsg, O);
+		return;
+	case (PAXOS_PROMISE):
+		oracle_handle_promise(&M->paxmsg, O);
+		return;
+	case (PAXOS_ACCEPT):
+		oracle_handle_accept(&M->paxmsg, O);
+		return;
+	case (PAXOS_ACCEPTED):
+		oracle_handle_accepted(&M->paxmsg, O);
+		return;
+	case (PAXOS_CLIENT_VALUE):
+		oracle_handle_client_value(&M->paxmsg, O);
+		return;
+	default:
+		return;
 	}
 }
+
 
 static oracle* alloc_oracle (struct evpaxos_config* tconf, unsigned vhist_cap) {
 	oracle* O = calloc(1, sizeof(oracle));
 
-	O->base = event_base_new();
-	O->peers = NULL;
+	/*O->socket = -1;
+	O->poll_set = malloc(max_node*sizeof(struct pollfd));
+	O->poll_count = 0;
+	O->msg_queue = malloc(ORACLE_MSGQ_CAP*sizeof(oracle_message));*/
+	O->isock = -1;
+	O->osock = -1;
+	O->nohup = NULL;
 
 	O->acc_count = tconf->acceptors_count;
 	O->pro_count = tconf->proposers_count;
@@ -270,38 +285,45 @@ static oracle* alloc_oracle (struct evpaxos_config* tconf, unsigned vhist_cap) {
 	return O;
 }
 
-oracle* init_oracle (struct evpaxos_config* tconf, unsigned vhist_cap, int port) {
+oracle* init_oracle (struct evpaxos_config* tconf, unsigned vhist_cap, atomic_bool* nohup) {
 	
 	oracle* O = alloc_oracle(tconf, vhist_cap);
-	O->base = event_base_new();
-	struct event* sigint_ev = evsignal_new(O->base, SIGINT, oracle_handle_sigint, O);
-	evsignal_add(sigint_ev, NULL);
-
-	O->peers = peers_new(O->base, tconf);
-		
-	// connect to acceptors and proposers
-	peers_connect_to_acceptors(O->peers);
-	oracle_connect_to_proposers(O, tconf);
-
-	if (peers_listen(O->peers, port) == 0) {
-		free(O);
-		return NULL;
+	O->nohup = nohup;
+	
+	// open the socket on which we recieve gremlin-diverted messages
+	int sv[2];
+	int s = socketpair(AF_UNIX, SOCK_SEQPACKET, 0, sv);
+	if (s == -1) {
+		perror("oracle: socketpair");
+		abort();
 	}
-
-	peers_subscribe(O->peers, PAXOS_PREPARE, oracle_handle_prepare, O);
-	peers_subscribe(O->peers, PAXOS_PROMISE, oracle_handle_promise, O);
-	peers_subscribe(O->peers, PAXOS_ACCEPT, oracle_handle_accept, O);
-	peers_subscribe(O->peers, PAXOS_ACCEPTED, oracle_handle_accepted, O);
-	peers_subscribe(O->peers, PAXOS_CLIENT_VALUE, oracle_handle_client_value, O);
-
+	
+	O->isock = sv[0];
+	O->osock = sv[1];
+/*
+	O->sock = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	if (O->sock == -1) {
+		perror("Oracle socket init");
+		abort();
+	}
+	struct sockaddr_un path = {
+		.sun_family = AF_UNIX,
+		.sun_path = ORACLE_SOCK_PATH
+	};
+	int s = bind(O->sock, &path, sizeof(struct sockaddr_un)); 
+	if (s == -1) {
+		perror("Oracle socket bind");
+		abort();
+	}
+	O->poll_set[0].fd = O->sock;
+	O->sock_poll[0].events = POLLIN;
+*/
 	// initial state should pass invariants
 	oracle_assert_invariants(O);
 	return O;
 }
 
 void free_oracle (oracle* O) {
-	event_base_free(O->base);
-	peers_free(O->peers);
 
 	free(O->acc_prombal);
 	free(O->acc_lastbal);
@@ -320,8 +342,117 @@ void free_oracle (oracle* O) {
 	free(O);
 }
 
-void* oracle_dispatch_thrd (void* O_v) {
+/*
+static void oracle_add_conn (oracle* O, int sockfd) {
+	O->poll_set[O->poll_count].fd = sockfd;
+	O->poll_set[O->poll_count].events = POLLIN;
+	++O->poll_count;
+}
+
+static void oracle_delete_conn (oracle* O, unsigned idx) {
+	close(O->poll_set[idx].fd);
+	// shift array up, overwriting entry @ idx
+	memmove(&(O->poll_set[idx]), &(O->poll_set[idx+1]),
+			&(O->poll_set[O->poll_count]) - &(O->poll_set[idx]));
+	--O->poll_count;
+}
+
+static void oracle_queue_message (oracle* O, const uint8_t* msgbuf) {
+	memcpy(&(O->msg_queue[O->qidx]), msgbuf, sizeof(oracle_msg_wrapper));
+	++qidx;
+	assert(qidx < ORACLE_MSGQ_CAP && "Need more space on queue!");
+}
+
+static void oracle_process_queue (oracle* O) {
+	// sort queued messages by timestamp (into index array)
+	int sortq[ORACLE_MSGQ_CAP] = {-1};
+	for (unsigned i = 0; i < O->qidx; ++i) {
+		unsigned j;
+		for (j = 0; sortq[j] > 0 &&
+				O->msg_queue[i].ts > O->msg_queue[sortq[j]].ts; ++j) {}
+		if (sortq[j] != -1) { // shift array down unless we are at the end
+			memmove(&sortq[j+1], &sortq[j], &sortq[ORACLE_MSGQ_CAP] - &sortq[j] - 1);
+		}
+		sortq[j] = i;
+	}
+
+	unsigned i = 0;
+	while (sortq[i] != -1) {
+		oracle_handle_message(O, O->msg_queue[sortq[i++]]);
+	}
+	O->qidx = 0;
+}
+*/
+
+// main oracle loop
+void* oracle_thread (void* O_v) {
 	oracle* O = (oracle*) O_v;
-	event_base_dispatch(O->base);
+
+	while (atomic_load(O->nohup)) {
+		oracle_message M;
+		int s = read(O->osock, &M, sizeof(oracle_message));
+		assert(s == sizeof(oracle_message));
+		oracle_handle_message(O, &M);
+	}
+
+	// start listening for new connections on our socket
+/*	int s = listen(O->sock, 8);	
+	if (s == -1) {
+		perror("Oracle socket listen");
+		abort();
+	}
+	
+	const struct timespec tmo = {-1, -1}; // no timeout
+	while (1) {
+		s = poll(&(O->poll_set), 1, &tmo, NULL);
+		if (s == -1) {
+			perror("Oracle socket poll");
+			abort();
+		}
+
+		if (O->poll_set[0].revent & POLLIN) { // new connection
+			while ( ( s = accept(O->sock, NULL, SOCK_NONBLOCK)) != -1) {
+				oracle_add_conn(O, s);
+			}
+
+			if (errno != EAGAIN) {
+				perror("Oracle socket accept");
+				abort();
+			}
+		}
+
+		uint8_t msgbuf[sizeof(oracle_message)];
+		for (unsigned i = 1; i < O->poll_count; ++i) {
+			assert(!(O->poll_set[i] & POLLNVAL));
+			if (O->poll_set[i].revent & POLLIN) { // new message from this node
+				while ( ( s = read(O->poll_set[i].fd, msgbuf, sizeof(oracle_message))) > 0) {
+					oracle_queue_message(O, msgbuf);
+				}
+
+				if (s == -1 && errno != EAGAIN) {
+					perror("Oracle subsock read");
+					abort();
+				}
+			}
+
+			if (O->poll_set[i] & POLLHUP) {
+				oracle_delete_conn(O, i);
+			}
+		}
+
+		oracle_process_queue();
+	}
+*/
+
 	return NULL;
+}
+
+void oracle_dispatch(oracle* O) {
+	pthread_t thr;
+	int s = pthread_create(&thr, NULL, oracle_thread, O);
+	assert(s == 0);
+}
+
+int oracle_getsock(oracle* O) {
+	return O->isock;
 }
