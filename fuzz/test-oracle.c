@@ -6,56 +6,41 @@
 #include <stdlib.h>
 #include <fcntl.h>
 
-#define EV_CONF_FILE "../../paxos.conf"
-#define FUZZ_CONF_FILE "fuzz.conf"
+#define FUZZ_FILE "vector.fuzz"
 #define PRELOAD_LIB "libfuzzing.so"
-
-#define ACCEPTOR "../sample/acceptor"
-#define PROPOSER "../sample/proposer"
-#define LEARNER "../sample/learner"
-#define CLIENT "../sample/client"
+#define MAXNODE 4
 
 int main () {
 
-	atomic_bool nohup;
-	atomic_init(&nohup, true);
-
-	struct evpaxos_config* conf = evpaxos_config_read(EV_CONF_FILE); 
-	oracle* O = init_oracle(conf, 32, &nohup);
+	const char* tmp_conf_path = start_node_gremlin(MAXNODE);
+	struct evpaxos_config* conf = evpaxos_config_read(tmp_conf_path); 
+	atomic_bool* nohup = gremlin_get_nohup();
+	oracle* O = init_oracle(conf, 32, nohup);
 	int osock = oracle_getsock(O);
-	start_gremlin (FUZZ_CONF_FILE, osock, &nohup);
+	start_delay_gremlin (FUZZ_FILE, osock, nohup);
 
-	setenv("LD_PRELOAD", PRELOAD_LIB, 1);
+	char* full_preload_path = realpath(PRELOAD_LIB, NULL);
+	if (!full_preload_path) {
+		perror("realpath");
+		abort();
+	}
+	int s = setenv("LD_PRELOAD", full_preload_path, 1);
+	if (s == -1) {
+		perror("setenv");
+		abort();
+	}
+	free(full_preload_path);
 
-	// spawn other nodes
-	int null_fd = open("/dev/null", 0);
-	if (fork() == 0) {
-		dup2(1, null_fd);
-		dup2(2, null_fd);
-		execl(ACCEPTOR, ACCEPTOR, "0", EV_CONF_FILE, (char*) 0);
-	}
-	if (fork() == 0) {
-		dup2(1, null_fd);
-		dup2(2, null_fd);
-		execl(ACCEPTOR, ACCEPTOR, "1", EV_CONF_FILE, (char*) 0);
-	}
-	if (fork() == 0) {
-		dup2(1, null_fd);
-		dup2(2, null_fd);
-		execl(PROPOSER, PROPOSER, "0", EV_CONF_FILE, (char*) 0);
-	}
-	if (fork() == 0) {
-		dup2(1, null_fd);
-		dup2(2, null_fd);
-		execl(LEARNER, LEARNER, EV_CONF_FILE, (char*) 0);
-	}
-	if (fork() == 0) {
-		execl(CLIENT, CLIENT, EV_CONF_FILE, "-p", "1", (char*) 0);
-	}
-	close(null_fd);
+	// spawn nodes
+	gremlin_add_node(NODE_PROPOSER);
+	gremlin_add_node(NODE_ACCEPTOR);
+	gremlin_add_node(NODE_ACCEPTOR);
+	gremlin_add_node(NODE_CLIENT);
 
 	oracle_thread(O);
 	free_oracle(O);
+	free_delay_gremlin();
+	free_node_gremlin();
 	return 0;
 }
 

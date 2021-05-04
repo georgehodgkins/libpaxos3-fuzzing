@@ -1,7 +1,6 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <sys/mman.h>
-#include <unistd.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -14,9 +13,11 @@
 #include <pthread.h>
 #define __USE_GNU
 #define _GNU_SOURCE
+#include <unistd.h>
 #include <dlfcn.h>
 #include <event.h>
 #include <event2/event.h>
+#include <signal.h>
 
 #include "gremlin.h"
 
@@ -71,7 +72,7 @@ typedef struct gremlin_ctl {
 	int wsock_fd; // socket to send messages to oracle
 	int rfifo_fd; // fifo to get delay bytes
 	unsigned int RS;
-	char* RF;
+	struct random_data* RF;
 	union {
 		bsaf_single_param single;
 		bsaf_permsg_param permsg;
@@ -80,13 +81,18 @@ typedef struct gremlin_ctl {
 	} param;
 } gremlin_ctl;
 
-// helper fn to get a byte off the FIFO
+// get a byte off the FIFO
 static uint8_t inj_getb(int fifo_fd) {
 	uint8_t nxt;
 	int s = read(fifo_fd, &nxt, 1);
 	if (s == -1) {
-		perror("delay fifo read");
-		abort();
+		if (errno == EAGAIN) { // no more bytes to read, normal termination condition
+			sigqueue(getppid(), SIGCHLD, (union sigval) 0);
+			exit(0);
+		} else {
+			perror("delay fifo read");
+			abort();
+		}
 	}
 	return nxt;
 }
@@ -271,6 +277,24 @@ static void inject_fixed_pernode(int fifo_fd, int rd, oracle_message* msg) {
 	nanosleep(&ts, NULL);
 }
 
+static const unsigned msg_size_tab[] = {
+	[PAXOS_PREPARE] = sizeof(paxos_prepare),
+	[PAXOS_PROMISE] = sizeof(paxos_promise),
+	[PAXOS_ACCEPT] = sizeof(paxos_accept),
+	[PAXOS_ACCEPTED] = sizeof(paxos_accepted),
+	[PAXOS_PREEMPTED] = sizeof(paxos_preempted),
+	[PAXOS_REPEAT] = sizeof(paxos_repeat),
+	[PAXOS_TRIM] = sizeof(paxos_trim),
+	[PAXOS_ACCEPTOR_STATE] = sizeof(paxos_acceptor_state),
+	[PAXOS_CLIENT_VALUE] = sizeof(paxos_client_value)
+};
+
+static void inject_bsaf_persize(int fifo_fd, int rd, oracle_message* msg) {
+	struct timespec ts = {0, rd};
+	ts.tv_nsec += gremlin->param.single.factor*msg_size_tab[msg->paxmsg.type];
+	nanosleep(&ts, NULL);
+}
+
 static void inject_none (int fifo_fd, int rd, oracle_message* msg) {
 	struct timespec ts = {0, rd};
 	if (ts.tv_nsec) nanosleep(&ts, NULL);
@@ -279,6 +303,7 @@ static void inject_none (int fifo_fd, int rd, oracle_message* msg) {
 static const inject_delay_t delay_injector[] = {
 	&inject_none,
 	&inject_fixed_pernode,
+	&inject_bsaf_persize,
 	&inject_bsaf_pernet,
 	&inject_bsaf_pernode_reciever,
 	&inject_bsaf_pernode_sender,
@@ -286,8 +311,9 @@ static const inject_delay_t delay_injector[] = {
 	&inject_bsaf_unified
 };
 
-static const size_t policy_reqd_size[] = {
+const size_t policy_reqd_size[] = {
 	0,
+	sizeof(bsaf_single_param),
 	sizeof(bsaf_single_param),
 	sizeof(bsaf_pernet_param),
 	sizeof(bsaf_pernode_param),
@@ -298,6 +324,7 @@ static const size_t policy_reqd_size[] = {
 
 static const policy_parse_t policy_parser[] = {
 	NULL,
+	&parse_single_param,
 	&parse_single_param,
 	&parse_pernet_param,
 	&parse_pernode_param,
@@ -318,9 +345,12 @@ typedef struct delay_pusher_args {
 
 void* delay_pusher_thread (void* arg_v) {
 	delay_pusher_args* arg = arg_v;
-	while (atomic_load(gremlin->nohup)) {
-		int s = write(arg->wfifo_fd, arg->loop, arg->loop_len);
-		assert(s == arg->loop_len);
+
+	uint8_t* loop = arg->loop;
+	uint8_t* loop_ub = &(arg->loop[arg->loop_len]);
+	while (atomic_load(gremlin->nohup) && loop < loop_ub) {
+		int s = write(arg->wfifo_fd, loop, arg->loop_len);
+		loop += s;
 	}
 
 	close(arg->wfifo_fd);
@@ -358,12 +388,12 @@ static void gremlin_dispatch (const char* config, gremlin_ctl* ctl) {
 	if (RFsel) {
 		s = read(fd, &ctl->RS, sizeof(unsigned int));
 		assert(s == sizeof(unsigned int));
-		ctl->RF = malloc(sizeof(uint8_t)*RAND_STATE_SIZE);
-		initstate(ctl->RS, ctl->RF, RAND_STATE_SIZE);
-		char* r = setstate(ctl->RF);
-		assert(r);
+		ctl->RF = malloc(sizeof(struct random_data));
+		char istate[RAND_STATE_SIZE];
+		s = initstate_r(ctl->RS, istate, RAND_STATE_SIZE, ctl->RF);
+		assert(s == 0);
 	}
-	
+
 	// parse parameters according to policy, advancing fd
 	if (policy_parser[dpol]) policy_parser[dpol](fd, ctl);
 
@@ -379,7 +409,7 @@ static void gremlin_dispatch (const char* config, gremlin_ctl* ctl) {
 	arg->loop = loop;
 	arg->loop_len = loop_len;
 	int pipefd[2];
-	s = pipe(pipefd);
+	s = pipe2(pipefd, O_NONBLOCK);
 	if (s == -1) {
 		perror("gremlin pipe");
 		abort();
@@ -392,7 +422,7 @@ static void gremlin_dispatch (const char* config, gremlin_ctl* ctl) {
 }
 
 
-void start_gremlin (const char* config, int osock, atomic_bool* nohup) {
+void start_delay_gremlin (const char* config, int osock, atomic_bool* nohup) {
 	// set up shm region for inter-process control info
 	ctl_fd = shm_open(GREMLIN_CTL_PATH, O_RDWR | O_CREAT | O_EXCL, 0);
 	if (ctl_fd == -1) {
@@ -422,6 +452,10 @@ failure_to_launch:
 	close(ctl_fd);
 	shm_unlink(GREMLIN_CTL_PATH);
 	abort();
+}
+
+void free_delay_gremlin () {
+	shm_unlink(GREMLIN_CTL_PATH);
 }
 
 // dynamically loaded hook to real message send
@@ -469,9 +503,13 @@ void gremlin_set_ts (oracle_message* m) {
 
 void* async_sender_thread(void* arg_v) {
 	async_sender_args* arg = arg_v;
+	// get randomness
+	int rd = 0;
+	if (gremlin->RF) {
+		random_r(gremlin->RF, &rd);
+	}
 	// inject delay according to control params
-	// TODO: random factor
-	gremlin->inject_delay(gremlin->rfifo_fd, 0, &arg->msg);
+	gremlin->inject_delay(gremlin->rfifo_fd, rd, &arg->msg);
 	// send message to oracle
 	gremlin_set_ts(&arg->msg);
 	write(gremlin->wsock_fd, &arg->msg, sizeof(oracle_message));
